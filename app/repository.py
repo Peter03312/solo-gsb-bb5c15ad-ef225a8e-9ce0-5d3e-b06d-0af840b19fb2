@@ -166,6 +166,24 @@ class ExemptionDuplicateRegions(Exception):
         self.duplicates = duplicates
 
 
+# ---------------------------------------------------------------- 预约未来批量变更
+
+class ScheduledBatchExecutionTimeInPast(Exception):
+    """预约执行时刻不严格晚于服务端受理时刻。"""
+
+
+class ScheduledBatchTerminal(Exception):
+    """预约已处于终态（succeeded/failed），取消与执行竞争只能产生一个终态。
+
+    携带终态状态名，调用方据此返回可区分错误（details 同时给出当前状态与
+    失败原因/提交结果摘要）。
+    """
+
+    def __init__(self, status: str):
+        super().__init__(f"预约已处于终态 {status}，不能再取消")
+        self.status = status
+
+
 def _row_to_region(row: dict) -> dict:
     return {
         "id": row["id"],
@@ -1615,3 +1633,199 @@ def list_observation_events(
     rows = cur.fetchall()
     has_more = len(rows) > limit
     return rows[:limit], has_more
+
+
+# ---------------------------------------------------------------- 预约未来批量变更
+
+_SCHEDULED_BATCH_COLUMNS = (
+    "id, execute_at, expected_revision, payload, status, created_at, "
+    "started_at, finished_at, cancelled_at, committed_revision, "
+    "result_json, error_json"
+)
+
+
+def validate_scheduled_batch_payload(payload, current: dict[int, dict] | None = None) -> None:
+    """受理时的**输入格式**校验（不依赖 revision 比对结果，无业务承诺）。
+
+    与正式批量提交一致，只检查请求自身是否自洽：同一现有区域在一批中
+    只能出现一次（duplicate_region），单条操作语义合法（invalid_operation，
+    如修订后 valid_from >= valid_to）。结构、多边形、轨迹的合法性已由
+    Pydantic/几何层在进入本函数前校验。
+
+    current 给出受理时的现有区域行（调用方持有 meta 锁时读取）：对
+    update 操作，部分字段合并后违反时段序同样在受理时拒绝；引用了
+    **不存在**区域的 update/delete 不在此处报错（区域编号本身格式
+    合法）——是否仍存在属于届时状态，到执行时刻随 region_not_found
+    重验。create 的时段序无需 current 即可判定。
+
+    受理**不**检查：expected_revision 是否匹配当前 revision、引用的现有
+    区域是否存在、轨迹在当前/变更后集合下是否安全、凭证/承诺保护是否
+    冲突——这些一律到执行时刻在写事务内重验，受理因此不预占 revision、
+    不保证届时可提交。
+    """
+    _check_batch_operation_targets(payload.operations)
+    if current is None:
+        current = {}
+    # 用与正式提交相同的内存规划逻辑做操作语义校验；把对缺失区域的
+    # region_not_found 从「错误」降级为「受理时不判定」：临时用占位行
+    # 补齐（时段本身合法），使纯格式校验（如部分更新合并后的时段序）
+    # 仍能进行；只有显式给出非法时段的 update 才在受理时拒绝
+    placeholder = {
+        "name": "", "polygon": None, "wkt": "POLYGON EMPTY",
+        "valid_from": datetime(2000, 1, 1, tzinfo=timezone.utc),
+        "valid_to": datetime(2100, 1, 1, tzinfo=timezone.utc),
+        "version": 1,
+    }
+    current_for_plan = dict(current)
+    for op in payload.operations:
+        if isinstance(op, (RegionUpdateInBatch, RegionDeleteInBatch)):
+            current_for_plan.setdefault(op.region_id, placeholder)
+    planned = _plan_batch_operations(payload.operations, current_for_plan)
+    # _plan_batch_operations 已抛出全部 BatchInvalidOperation；其返回值
+    # 仅用于校验，不落库、不预分配编号
+    return planned
+
+
+def _batch_payload_json(payload) -> dict:
+    """把规范化后的批量请求转为可持久化/回显的 JSON 结构（不含 execute_at）。"""
+    dumped = payload.model_dump(mode="json")
+    dumped.pop("execute_at", None)
+    return dumped
+
+
+def create_scheduled_batch(cur, payload) -> dict:
+    """受理一笔预约：在持有 region_meta 行锁的写事务内持久化为 pending。
+
+    执行时刻必须**严格晚于受理时刻**（以拿到写锁后的当前服务时间为准），
+    否则抛 ScheduledBatchExecutionTimeInPast。受理不推进区域 revision、
+    不预分配区域编号，也不写区域变更审计。
+    """
+    # 与所有区域写入、凭证/承诺/观察操作同一把 meta 行锁：受理时刻以拿到
+    # 锁后的服务时间为准，避免「时钟判定到落库之间被插队」
+    get_revision(cur)
+    now = utcnow()
+    if payload.execute_at <= now:
+        raise ScheduledBatchExecutionTimeInPast()
+    # 持锁读取当前区域行，仅用于操作语义的格式校验（update 合并后的时段
+    # 序）；revision 匹配、区域存在性、轨迹安全与凭证/承诺保护均不在受理
+    # 时判定
+    current = _load_all_regions_locked(cur)
+    validate_scheduled_batch_payload(payload, current)
+    stored = _batch_payload_json(payload)
+    cur.execute(
+        """
+        INSERT INTO scheduled_batches
+            (execute_at, expected_revision, payload, status)
+        VALUES (%(execute_at)s, %(expected_revision)s, %(payload)s::jsonb, 'pending')
+        RETURNING """ + _SCHEDULED_BATCH_COLUMNS,
+        {
+            "execute_at": payload.execute_at,
+            "expected_revision": payload.expected_revision,
+            "payload": json.dumps(stored),
+        },
+    )
+    return cur.fetchone()
+
+
+def get_scheduled_batch(cur, schedule_id: int) -> dict | None:
+    cur.execute(
+        "SELECT " + _SCHEDULED_BATCH_COLUMNS + " FROM scheduled_batches WHERE id = %s",
+        (schedule_id,),
+    )
+    return cur.fetchone()
+
+
+def cancel_scheduled_batch(cur, schedule_id: int) -> tuple[dict | None, bool]:
+    """取消待执行预约；返回 (预约行, 本次是否首次取消)。
+
+    与到期执行共用同一加锁顺序（先 region_meta 行、后预约行 FOR UPDATE），
+    因此取消与执行在数据库行锁上互斥，竞争只会产生一个终态：
+
+    * 预约不存在：返回 (None, False)（调用方回滚并返回 404）；
+    * 待执行：置为 cancelled 并置 cancelled_at，返回 (行, True)；
+    * 已取消：幂等返回现状 (行, False)，不改动任何时间戳；
+    * 已成功/已失败（终态）：抛 ScheduledBatchTerminal，调用方返回 409，
+      与「未知编号 404」「成功取消 200」均可区分。
+    """
+    # 先锁全局 meta 行：执行器在 meta 锁内领取预约行，取消按同一顺序等待，
+    # 杜绝「执行持有预约行等 meta、取消持有 meta 等预约行」的交叉等待
+    get_revision(cur)
+    cur.execute(
+        "SELECT " + _SCHEDULED_BATCH_COLUMNS
+        + " FROM scheduled_batches WHERE id = %s FOR UPDATE",
+        (schedule_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None, False
+    if row["status"] in ("succeeded", "failed"):
+        raise ScheduledBatchTerminal(row["status"])
+    if row["status"] == "cancelled":
+        return row, False
+    cur.execute(
+        """
+        UPDATE scheduled_batches
+        SET status = 'cancelled', cancelled_at = now()
+        WHERE id = %s
+        RETURNING """ + _SCHEDULED_BATCH_COLUMNS,
+        (schedule_id,),
+    )
+    return cur.fetchone(), True
+
+
+def claim_due_scheduled_batches(cur, now: datetime, limit: int = 50) -> list[dict]:
+    """在持有 region_meta 行锁的事务内，按（执行时刻、编号）顺序领取到期预约。
+
+    只选 status='pending' 且 execute_at <= now 的预约，按
+    (execute_at, id) 升序用 FOR UPDATE SKIP LOCKED 锁定至多 limit 行：
+    重启后未完成的待执行行会被重新领取；并发的另一个处理者（如多进程
+    部署、取消与执行竞争）拿不到同一行，因此同一预约无论重启或并发都
+    至多被提交一次。调用方必须已先持有 region_meta 行锁（与
+    cancel_scheduled_batch 保持「meta 行 → 预约行」的同一加锁顺序）。
+    """
+    cur.execute(
+        """
+        SELECT """ + _SCHEDULED_BATCH_COLUMNS + """
+        FROM scheduled_batches
+        WHERE status = 'pending' AND execute_at <= %s
+        ORDER BY execute_at ASC, id ASC
+        LIMIT %s
+        FOR UPDATE SKIP LOCKED
+        """,
+        (now, limit),
+    )
+    return cur.fetchall()
+
+
+def mark_scheduled_batch_succeeded(
+    cur, row: dict, revision: int, result: dict, now: datetime
+) -> None:
+    """把预约标记为成功，并把与 /api/regions/batch 一致的提交结果写回。"""
+    cur.execute(
+        """
+        UPDATE scheduled_batches
+        SET status = 'succeeded', started_at = %s, finished_at = %s,
+            committed_revision = %s, result_json = %s::jsonb, error_json = NULL
+        WHERE id = %s
+        """,
+        (now, now, revision, json.dumps(result, ensure_ascii=False), row["id"]),
+    )
+
+
+def mark_scheduled_batch_failed(
+    cur, row: dict, error: dict, now: datetime
+) -> None:
+    """把预约标记为失败并写入沿用批量变更错误码的可查询原因。
+
+    区域集合不在同一事务内改变（失败的批量变更发生在已回滚的保存点内），
+    因此本更新与区域数据完全无关，只是给预约行留下终态与原因。
+    """
+    cur.execute(
+        """
+        UPDATE scheduled_batches
+        SET status = 'failed', started_at = %s, finished_at = %s,
+            result_json = NULL, error_json = %s::jsonb
+        WHERE id = %s
+        """,
+        (now, now, json.dumps(error, ensure_ascii=False), row["id"]),
+    )

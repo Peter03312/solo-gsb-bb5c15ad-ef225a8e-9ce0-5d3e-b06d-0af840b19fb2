@@ -181,6 +181,40 @@ CREATE TABLE IF NOT EXISTS region_change_audit (
     CONSTRAINT region_change_audit_type_check
         CHECK (change_type IN ('create', 'update', 'delete', 'batch'))
 );
+
+-- 预约的未来批量限行区域调整：受理时只校验输入格式（operations/trajectories
+-- 结构合法、同一现有区域不重复、执行时刻带时区且在未来），不预占 revision、
+-- 不预分配区域编号，也不保证届时可提交。到期由后台调度在「region_meta 行 →
+-- 预约行」的加锁顺序下领取（FOR UPDATE SKIP LOCKED），在与现有区域写入共用
+-- 的事务锁内重验 revision、操作、轨迹安全及凭证/承诺保护：成功才与区域、
+-- revision、观察翻转事件、审计同一事务提交；失败只把沿用批量变更错误码的
+-- 可查询原因写回本预约行，区域集合不变。同一预约行的领取/取消互斥，因此
+-- 无论重启或并发处理，同一预约至多提交一次。
+CREATE TABLE IF NOT EXISTS scheduled_batches (
+    id                BIGSERIAL PRIMARY KEY,
+    execute_at        TIMESTAMPTZ NOT NULL,
+    expected_revision BIGINT NOT NULL,
+    -- 规范化后的完整批量请求（与 POST /api/regions/batch 一致的 JSON 结构；
+    -- 时刻已归一化为 UTC、多边形已归一化为逆时针闭合环）
+    payload           JSONB NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'pending',
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at        TIMESTAMPTZ,
+    finished_at       TIMESTAMPTZ,
+    cancelled_at      TIMESTAMPTZ,
+    -- 成功执行后的提交结果（与 /api/regions/batch 成功响应体一致）
+    result_json       JSONB,
+    committed_revision BIGINT,
+    -- 失败原因（沿用批量变更错误码）：{"code","message","details"}
+    error_json        JSONB,
+    CONSTRAINT scheduled_batches_status_check
+        CHECK (status IN ('pending', 'succeeded', 'failed', 'cancelled'))
+);
+
+-- 后台调度按「执行时刻、预约编号」顺序领取到期预约
+CREATE INDEX IF NOT EXISTS idx_scheduled_batches_due
+    ON scheduled_batches (execute_at, id)
+    WHERE status = 'pending';
 """
 
 

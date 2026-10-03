@@ -14,7 +14,7 @@ from psycopg.errors import CheckViolation
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import db, geometry, repository
+from . import db, geometry, repository, scheduler
 from .repository import (
     BatchDuplicateRegion,
     BatchInvalidOperation,
@@ -35,6 +35,8 @@ from .repository import (
     IdempotencyKeyConflict,
     PassConflict,
     PassUnsafe,
+    ScheduledBatchExecutionTimeInPast,
+    ScheduledBatchTerminal,
 )
 from .schemas import (
     CommitmentFulfillRequest,
@@ -59,6 +61,9 @@ from .schemas import (
     RegionResultOut,
     RegionUpdate,
     RevisionOut,
+    ScheduledBatchCancelledOut,
+    ScheduledBatchOut,
+    ScheduledBatchRequest,
     ScheduleRequest,
     ScheduleResponse,
     VerifyRequest,
@@ -72,13 +77,22 @@ logger = logging.getLogger("restriction-service")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_pool()
+    # 启动到期预约批量变更的后台执行器：先同步跑一轮，使服务「启动即
+    # 可用」——重启期间到期的待执行预约在开始接客前按序处理一次；之后
+    # 由守护线程周期领取
+    try:
+        scheduler.run_due_scheduled_batches()
+    except Exception:  # 首轮失败不阻止启动，守护线程会继续重试
+        logger.exception("启动时处理到期预约失败，将由后台线程继续重试")
+    scheduler.worker.start()
     yield
+    scheduler.worker.stop()
     db.close_pool()
 
 
 app = FastAPI(
     title="临时限行核验服务",
-    version="1.10.0",
+    version="1.11.0",
     description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；安全员还可把尚未取消、窗口未结束的承诺兑现为一张固定时刻通行凭证（POST /api/commitments/{id}/fulfill）：在与区域变更、承诺取消及凭证签发共用的写事务内重验出发时刻晚于受理时刻、落在原候选窗口与按当前区域集合重算的安全出发区间内，成功后原承诺按既有取消语义失效、只生成一张凭证，区域 revision 不变，并发兑现至多一次成功且失败方可区分已兑现与普通取消；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）在同一事务追加只读可分页的区域集合变更审计历史，并支持 Idempotency-Key 幂等重试；安全员还可对固定行程做最小区域豁免预演（只读）：在可豁免候选区域的子集中找出使候选窗口内存在安全出发时刻的最优方案（豁免数最少、最早安全时刻、编号字典序），预演不改变任何数据；也可对多区调整做批量变更影响预演（只读）：基于同一已提交快照报告各轨迹安全结论与穿越明细、将冲突的通行凭证、将被清空的择时承诺与观察结论净翻转，预演不改变任何数据、不占用区域编号。",
     lifespan=lifespan,
 )
@@ -270,6 +284,26 @@ def _commitment_row_to_out(row: dict, intervals: list[dict]) -> dict:
         "issued_at": row["created_at"],
         "cancelled_at": row["cancelled_at"],
         "fulfilled_pass_id": row.get("fulfilled_pass_id"),
+    }
+
+
+def _scheduled_batch_row_to_out(row: dict) -> dict:
+    """把 scheduled_batches 表行转成预约 API 输出（回显规范化后的请求内容）。"""
+    payload = row["payload"]
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "execute_at": row["execute_at"],
+        "expected_revision": row["expected_revision"],
+        "operations": payload["operations"],
+        "trajectories": payload["trajectories"],
+        "created_at": row["created_at"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "cancelled_at": row["cancelled_at"],
+        "committed_revision": row.get("committed_revision"),
+        "result": row.get("result_json"),
+        "error": row.get("error_json"),
     }
 
 
@@ -579,6 +613,33 @@ async def _on_exemption_duplicate_regions(_request: Request, exc: ExemptionDupli
           "message": f"区域 {rid} 在候选豁免编号中出现了多次",
           "region_id": rid}
          for rid in exc.duplicates],
+    )
+
+
+@app.exception_handler(ScheduledBatchExecutionTimeInPast)
+async def _on_scheduled_execution_time_in_past(
+    _request: Request, exc: ScheduledBatchExecutionTimeInPast
+):
+    return _error_response(
+        422,
+        "execution_time_not_in_future",
+        "预约执行时刻必须严格晚于服务端受理时刻（当前服务时间）",
+        [{"loc": ["body", "execute_at"],
+          "message": "execute_at 必须是服务端受理时刻之后的未来时刻"}],
+    )
+
+
+@app.exception_handler(ScheduledBatchTerminal)
+async def _on_scheduled_batch_terminal(_request: Request, exc: ScheduledBatchTerminal):
+    messages = {
+        "succeeded": "预约已成功执行并提交，终态不可取消",
+        "failed": "预约已到期执行失败并记录失败原因，终态不可取消",
+    }
+    return _error_response(
+        409,
+        "scheduled_batch_terminal",
+        messages.get(exc.status, f"预约已处于终态 {exc.status}，不能再取消"),
+        [{"loc": ["path", "schedule_id"], "status": exc.status}],
     )
 
 
@@ -1006,6 +1067,130 @@ def preview_batch_change(payload: RegionBatchRequest):
         ],
         observation_flips=report["observation_flips"],
     )
+
+
+# ------------------------------------------------ 预约未来批量变更
+
+@app.post("/api/regions/batch/schedule", response_model=ScheduledBatchOut,
+          status_code=201,
+          responses={
+              422: {"description": "执行时刻不带时区/非未来，或批量请求格式非法"},
+          },
+          tags=["regions"])
+def schedule_batch_change(payload: ScheduledBatchRequest):
+    """预约一次**未来**执行的批量限行区域调整。
+
+    请求体在 `POST /api/regions/batch` 的内容（`expected_revision`、按序
+    `operations`、`trajectories`）之外增加带时区的 `execute_at`（服务端
+    归一化为 UTC，可提交 `+08:00` 等任意偏移）。
+
+    **受理时只校验输入格式**：结构/多边形/轨迹合法性、同一现有区域在
+    一批中只出现一次、单条操作语义（如 create 的 `valid_from <
+    valid_to`），以及 `execute_at` 带时区且**严格晚于服务端受理时刻**
+    （以拿到 region_meta 写锁后的当前时间为准）。受理**不预占
+    revision、不预分配区域编号，也不保证届时可提交**——revision 是否
+    匹配、引用区域是否仍存在、轨迹与凭证/承诺保护是否满足，都到执行
+    时刻在与现有区域写入共用的事务锁内重验。
+
+    预约持久保存并返回 **201**：预约 `id`、`status="pending"`、归一化
+    后的 `execute_at`、回显的 `expected_revision`/`operations`/
+    `trajectories` 与受理时刻 `created_at`。到期由后台执行器按
+    （执行时刻、预约编号）顺序处理；执行时刻不带时区或不晚于受理时刻
+    返回 **422**（`validation_error` / `execution_time_not_in_future`），
+    批量格式问题沿用批量错误码（`duplicate_region`/
+    `invalid_operation`/`invalid_trajectory` 等），受理失败一律不落库。
+    """
+    # 轨迹合法性（点数、有限坐标、时刻严格递增、带时区）在几何层统一报错；
+    # 重复区域/操作语义在写事务持锁后做受理格式校验，revision 匹配、区域
+    # 存在性、轨迹安全与凭证/承诺保护则一律到执行时刻重验
+    trajectories = [
+        geometry.validate_trajectory(points, lambda p: p.t)
+        for points in payload.trajectories
+    ]
+
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            try:
+                row = repository.create_scheduled_batch(cur, payload)
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+    return _scheduled_batch_row_to_out(row)
+
+
+@app.get("/api/regions/batch/schedule/{schedule_id}",
+         response_model=ScheduledBatchOut, tags=["regions"])
+def get_scheduled_batch(schedule_id: int = Path(ge=1)):
+    """查询预约：返回状态、执行时间，以及成功提交结果或失败原因。
+
+    * `pending`：待执行，`result`/`error` 均为 null；
+    * `succeeded`：已在执行时刻一次性提交，`result` 与
+      `POST /api/regions/batch` 成功响应一致（含新 revision、逐操作与
+      逐轨迹核验结果），`committed_revision` 为新 revision，`error` 为 null；
+    * `failed`：到期重验失败，区域集合未改变，`result` 为 null，`error`
+      为沿用批量变更错误码的可查询原因（`code`/`message`/`details`）；
+    * `cancelled`：已取消（取消幂等），`cancelled_at` 置位。
+
+    未知编号返回 **404** `not_found`。
+    """
+    with db.pool.connection() as conn:
+        conn.rollback()
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            row = repository.get_scheduled_batch(cur, schedule_id)
+    if row is None:
+        raise StarletteHTTPException(
+            status_code=404,
+            detail={"error": {"code": "not_found",
+                              "message": f"预约 {schedule_id} 不存在"}},
+        )
+    return _scheduled_batch_row_to_out(row)
+
+
+@app.post("/api/regions/batch/schedule/{schedule_id}/cancel",
+          response_model=ScheduledBatchCancelledOut, tags=["regions"])
+def cancel_scheduled_batch(schedule_id: int = Path(ge=1)):
+    """取消**待执行**预约。
+
+    取消与到期执行共用同一加锁顺序（region_meta 行 → 预约行 FOR
+    UPDATE），因此二者竞争时由数据库行锁决定先后、只会产生一个终态：
+
+    * 待执行：置为 `cancelled` 并返回 200（`cancelled=true`）；
+    * 已取消：幂等返回现状（`cancelled=false`，200）；
+    * 已成功/已失败：返回 **409** `scheduled_batch_terminal`（details
+      带当前 `status`，成功/失败可经查询结果区分）；
+    * 未知编号：**404** `not_found`。
+
+    取消不推进区域 revision。
+    """
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            try:
+                result = repository.cancel_scheduled_batch(cur, schedule_id)
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                if result[0] is None:
+                    conn.rollback()
+                else:
+                    conn.commit()
+    row, first_cancel = result
+    if row is None:
+        raise StarletteHTTPException(
+            status_code=404,
+            detail={"error": {"code": "not_found",
+                              "message": f"预约 {schedule_id} 不存在"}},
+        )
+    view = _scheduled_batch_row_to_out(row)
+    view["cancelled"] = first_cancel
+    return view
 
 
 # ---------------------------------------------------------------- 通行凭证
@@ -1650,6 +1835,9 @@ def root():
             "PATCH /api/regions/{id}", "DELETE /api/regions/{id}",
             "POST /api/regions/batch",
             "POST /api/regions/batch/preview",
+            "POST /api/regions/batch/schedule",
+            "GET /api/regions/batch/schedule/{id}",
+            "POST /api/regions/batch/schedule/{id}/cancel",
             "GET /api/regions/changes",
             "GET /api/revision", "POST /api/verify", "POST /api/schedule",
             "POST /api/exemptions/preview",

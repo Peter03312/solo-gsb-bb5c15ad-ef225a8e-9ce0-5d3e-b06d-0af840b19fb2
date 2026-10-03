@@ -213,6 +213,26 @@ class RegionBatchRequest(BaseModel):
         return v
 
 
+class ScheduledBatchRequest(RegionBatchRequest):
+    """预约一次**未来**执行的批量变更：在批量变更请求之外增加带时区的
+    执行时刻 execute_at。
+
+    受理时只做输入格式校验（结构/多边形/轨迹/操作语义/重复区域/执行时刻
+    带时区且严格晚于受理时刻），**不预占 revision、不预分配区域编号，也不
+    保证届时可提交**：revision 是否匹配、引用区域是否存在、轨迹与凭证/
+    承诺保护是否仍满足，一律到执行时刻在写事务内重验。
+    """
+
+    execute_at: datetime = Field(
+        description="带时区的执行时刻（服务端归一化为 UTC），必须严格晚于受理时刻"
+    )
+
+    @field_validator("execute_at")
+    @classmethod
+    def _check_execute_at(cls, v: datetime) -> datetime:
+        return _require_utc(v, "execute_at")
+
+
 class VerifyRequest(BaseModel):
     points: list[PointIn] = Field(min_length=2)
 
@@ -481,6 +501,45 @@ class RegionBatchResponse(_UTCDatetimeModel):
     revision: int
     operations: list[BatchOperationResultOut]
     trajectories: list[TrajectoryCheckOut]
+
+
+# ---------------------------------------------------------------- 预约未来批量变更
+
+class ScheduledBatchOut(_UTCDatetimeModel):
+    """预约批量变更：受理/查询/取消的统一响应。
+
+    status 为 pending（待执行）/ succeeded（已成功提交）/ failed
+    （到期执行失败，区域集合未改变）/ cancelled（已取消，取消幂等）；
+    execute_at 为服务端归一化后的 UTC 执行时刻；created_at 为受理时刻。
+    succeeded 时 result 为与 POST /api/regions/batch 成功响应一致的提交
+    结果（含新 revision、逐操作结果与逐轨迹核验结果）、committed_revision
+    为提交后的新 revision、error 为 null；failed 时 result 为 null、
+    error 为沿用批量变更错误码的失败原因 {code,message,details}；
+    pending 与 cancelled 时 result/error 均为 null。
+    operations/trajectories 回显受理时规范化后的有序请求内容。
+    """
+
+    id: int
+    status: str
+    execute_at: datetime
+    expected_revision: int
+    operations: list[dict]
+    trajectories: list[list[dict]]
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    cancelled_at: datetime | None = None
+    committed_revision: int | None = None
+    result: dict | None = None
+    error: dict | None = None
+
+
+class ScheduledBatchCancelledOut(ScheduledBatchOut):
+    """取消结果：在预约视图之外显式给出本次调用是否把状态从待执行改为
+    已取消（cancelled=true 为首次取消；对已取消预约重复取消时为 false，
+    响应幂等不变）。终态 succeeded/failed 的取消请求返回 409。"""
+
+    cancelled: bool
 
 
 # ---------------------------------------------------------------- 批量变更影响预演

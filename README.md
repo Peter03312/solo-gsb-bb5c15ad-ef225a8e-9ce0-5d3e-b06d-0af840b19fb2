@@ -22,7 +22,7 @@ revision 不变），并发兑现至多一次成功。安全员还可为**带时
 编号、当前安全结论与区域 revision；单区及批量区域变更成功时，对未取消且
 末点未过的观察比较变更前后安全结论，**仅结论翻转**才在**同一事务**留一条
 含观察编号、旧/新结论与新 revision 的事件（整批至多一条/观察）；观察
-**不阻止**区域变更，也不改变通行凭证与择时承诺的保护。**每次成功的区域集合变更**（单区登记/修订/删除与批量变更）还会在**同一事务**追加一条**只读审计记录**（revision、发生时间、变更类型、涉及区域编号与批量操作摘要），安全员可按全局 revision 游标升序分页读取。此外，安全员可为一条固定行程做**最小区域豁免预演**（只读）：输入相对秒数轨迹、带时区候选出发窗口、可豁免的互异现有区域编号与已读 revision，系统在候选区域的子集中找出使窗口内至少存在安全出发时刻的方案（豁免数最少、最早安全时刻、编号字典序），返回所据 revision、豁免编号、最早安全时刻与完整安全出发区间；预演不改变任何数据。安全员还可在正式提交多区调整前做**批量变更影响预演**（只读）：输入与批量变更相同（预期 revision、按序登记/修订/删除操作、待核验轨迹），基于同一已提交快照报告各轨迹在拟变更完整区域集合下的安全结论与穿越明细、若提交将冲突的有效通行凭证、变更前仍有未来安全时刻而变更后被清空的择时承诺，以及有效观察的结论净翻转（旧/新结论）；拟登记区域以操作下标标识、不分配正式编号，预演不改变任何数据、不占用编号。
+**不阻止**区域变更，也不改变通行凭证与择时承诺的保护。**每次成功的区域集合变更**（单区登记/修订/删除与批量变更）还会在**同一事务**追加一条**只读审计记录**（revision、发生时间、变更类型、涉及区域编号与批量操作摘要），安全员可按全局 revision 游标升序分页读取。此外，安全员可为一条固定行程做**最小区域豁免预演**（只读）：输入相对秒数轨迹、带时区候选出发窗口、可豁免的互异现有区域编号与已读 revision，系统在候选区域的子集中找出使窗口内至少存在安全出发时刻的方案（豁免数最少、最早安全时刻、编号字典序），返回所据 revision、豁免编号、最早安全时刻与完整安全出发区间；预演不改变任何数据。安全员还可在正式提交多区调整前做**批量变更影响预演**（只读）：输入与批量变更相同（预期 revision、按序登记/修订/删除操作、待核验轨迹），基于同一已提交快照报告各轨迹在拟变更完整区域集合下的安全结论与穿越明细、若提交将冲突的有效通行凭证、变更前仍有未来安全时刻而变更后被清空的择时承诺，以及有效观察的结论净翻转（旧/新结论）；拟登记区域以操作下标标识、不分配正式编号，预演不改变任何数据、不占用编号。安全员还可以**预约一次未来的批量限行区域调整**：提交带时区的未来执行时刻、预期 revision 与同正式批量一致的有序 operations/trajectories，受理只校验输入格式（不预占 revision、不预分配编号、不保证届时可提交），预约持久保存并取得预约编号与待执行状态；到期由后台执行器按执行时刻、编号顺序在与现有区域写入共用的事务锁内重验 revision、操作、轨迹安全及有效凭证与择时承诺保护，成功才一次性更新区域、revision、观察翻转事件与审计，失败只记录沿用批量变更错误码的可查询原因、区域集合不变；同一预约无论重启或并发处理都至多提交一次；待执行预约可取消，取消与执行竞争只会产生一个终态。
 
 ## 核验规则
 
@@ -163,6 +163,122 @@ curl -X POST http://localhost:8000/api/regions/batch/preview \
          {"x":-50,"y":150,"t":"2030-06-01T10:00:00Z"},
          {"x":150,"y":150,"t":"2030-06-01T10:01:00Z"}]]}'
 ```
+
+## 预约未来批量变更规则（受理 / 到期执行 / 查询 / 取消）
+
+安全员可以预约一次**未来**的批量限行区域调整：请求体在
+`POST /api/regions/batch` 的内容（`expected_revision`、按序 `operations`、
+`trajectories`）之外增加带时区的**执行时刻** `execute_at`。
+
+* **受理 `POST /api/regions/batch/schedule`（201 pending）**：受理时
+  **只校验输入格式**——请求结构/多边形/轨迹合法性（同批量接口的
+  `validation_error`/`invalid_polygon`/`invalid_trajectory`）、同一现有
+  区域在一批中只出现一次（`duplicate_region`）、单条操作语义合法
+  （create 及 update 合并后的 `valid_from < valid_to` 等，
+  `invalid_operation`），以及 `execute_at` **带时区**且**严格晚于服务端
+  受理时刻**（以服务端拿到 region_meta 写锁后的当前时间为准）。
+  * **不预占 revision、不预分配区域编号、不保证届时可提交**：受理时
+    **不**比对 `expected_revision`、**不**检查引用区域是否存在、**不**
+    核验轨迹在任何集合下是否安全、**不**检查凭证/承诺保护；这些一律
+    到执行时刻在写事务内重验（因此过期 revision、引用未来可能被删的
+    区域、甚至受理时就穿越当前集合的轨迹都可以先成功预约）。
+  * 受理在持有全局元数据行锁的写事务内持久化，**不推进**区域
+    revision、不写审计；成功返回预约 `id`、`status="pending"`、归一化
+    为 UTC 的 `execute_at`、回显的 `expected_revision`/有序
+    `operations`/`trajectories` 与 `created_at`。
+  * `execute_at` 不带时区 → 422 `validation_error`；不严格晚于受理时刻
+    （过去时刻或恰为当前时刻）→ 422 `execution_time_not_in_future`；
+    可提交 `+08:00` 等任意时区偏移，服务端归一化为 UTC。
+* **到期执行（后台，无需调用方触发）**：后台执行器周期轮询，把
+  `execute_at <= 当前时刻` 且仍为 pending 的预约按**（执行时刻、预约
+  编号）升序**领取（`FOR UPDATE SKIP LOCKED`），在与现有区域写入
+  **共用的 region_meta 事务锁**内执行——即重放一次正式批量提交：
+  * 重验 revision 匹配、区域存在、操作合法、全部轨迹在变更后完整集合
+    下安全、有效凭证（`pass_conflict`）与未结束择时承诺
+    （`commitment_conflict`）保护；
+  * **成功**：区域写入、整批一次 revision 推进、未结束观察的结论翻转
+    事件与批量变更审计，与预约行的 `succeeded` 终态及提交结果在
+    **同一事务**提交；`result` 与 `/api/regions/batch` 成功响应逐字段
+    一致（新 revision、逐操作结果含新区域 id/version、逐轨迹核验明细）；
+  * **失败**：批量变更在保存点内回滚（区域集合、revision、version、
+    观察结论、审计均不变），预约行在外层事务记为 `failed`，`error`
+    保存**沿用现有批量变更错误码**的 `{code,message,details}`
+    （`revision_conflict`(409 语义)/`region_not_found`/
+    `duplicate_region`/`invalid_operation`/`unsafe_trajectory`/
+    `pass_conflict`/`commitment_conflict`/`invalid_trajectory` 等），
+    可通过查询接口读取；失败不阻塞后续到期预约。
+  * **至多提交一次**：领取与取消共用「region_meta 行 → 预约行」的同一
+    加锁顺序，行锁 + `SKIP LOCKED` 保证同一预约无论进程重启还是并发
+    处理都**至多提交一次**；终态（succeeded/failed/cancelled）行不会再
+    被领取。应用重启期间到期的 pending 预约会在启动时先同步处理一轮，
+    之后由守护线程继续领取（崩溃在提交前 → 预约仍 pending，下次重新
+    执行；崩溃在提交后 → 已是终态，不重复）。
+* **查询 `GET /api/regions/batch/schedule/{id}`**：返回预约状态、执行
+  时间、回显请求，以及终态结果：
+  * `pending`：`result`/`error` 均为 null；
+  * `succeeded`：`result` 为批量成功响应、`committed_revision` 为新
+    revision、`error` 为 null；
+  * `failed`：`result` 为 null、`error` 为失败原因（同批量错误信封）；
+  * `cancelled`：`cancelled_at` 置位、`result`/`error` 为 null。
+  未知编号 → **404** `not_found`。
+* **取消 `POST /api/regions/batch/schedule/{id}/cancel`**：只对
+  **待执行**预约生效；取消与到期执行在数据库行锁上互斥，竞争只产生
+  一个终态：
+  * pending → 置 `cancelled` 返回 200（响应额外带 `cancelled=true`）；
+  * 重复取消幂等返回 200（`cancelled=false`，状态/时间戳不变）；
+  * 已成功/已失败的终态预约取消 → **409** `scheduled_batch_terminal`
+    （details 带当前 `status`，成功/失败再经查询结果区分），与「未知
+    编号 404」可区分；
+  * 取消不推进区域 revision；已取消的预约到期不再执行。
+
+```bash
+# 预约一笔未来（如 1 分钟后）执行的批量变更
+curl -X POST http://localhost:8000/api/regions/batch/schedule \
+  -H 'Content-Type: application/json' \
+  -d '{"execute_at": "2026-10-03T10:30:00+08:00",
+       "expected_revision": 1,
+       "operations": [
+         {"action":"create","name":"D区",
+          "polygon":[[0,120],[100,120],[100,180],[0,180]],
+          "valid_from":"2030-01-01T00:00:00Z","valid_to":"2030-12-31T00:00:00Z"},
+         {"action":"delete","id":1}],
+       "trajectories": [[
+         {"x":-50,"y":200,"t":"2030-06-01T10:00:00Z"},
+         {"x":900,"y":200,"t":"2030-06-01T10:02:00Z"}]]}'
+# 查询状态/执行时间/提交结果或失败原因；取消待执行预约（幂等）
+curl http://localhost:8000/api/regions/batch/schedule/1
+curl -X POST http://localhost:8000/api/regions/batch/schedule/1/cancel
+```
+
+成功受理响应（201）：
+
+```json
+{
+  "id": 1,
+  "status": "pending",
+  "execute_at": "2026-10-03T02:30:00Z",
+  "expected_revision": 1,
+  "operations": [ /* 回显有序操作 */ ],
+  "trajectories": [ /* 回显有序轨迹 */ ],
+  "created_at": "2026-10-03T02:00:00Z",
+  "started_at": null,
+  "finished_at": null,
+  "cancelled_at": null,
+  "committed_revision": null,
+  "result": null,
+  "error": null
+}
+```
+
+| 状态码 | error.code | 触发条件 |
+| --- | --- | --- |
+| 422 | `execution_time_not_in_future` | `execute_at` 不严格晚于受理时刻（过去/恰为现在） |
+| 422 | `validation_error` | `execute_at` 不带时区，或请求结构/多边形非法（同批量接口） |
+| 422 | `invalid_trajectory` | 受理时轨迹结构非法（点数/有限坐标/时刻严格递增） |
+| 422 | `duplicate_region` / `invalid_operation` | 受理时同一现有区域重复 / 单条操作语义非法 |
+| 404 | `not_found` | 查询/取消未知预约编号 |
+| 409 | `scheduled_batch_terminal` | 取消已成功/已失败的终态预约（details 带 status） |
+| —（终态 `failed` 可查） | `revision_conflict` / `region_not_found` / `unsafe_trajectory` / `pass_conflict` / `commitment_conflict` / `invalid_operation` / … | 到期重验失败，沿用现有批量变更错误码写入 `error`，区域集合不变 |
 
 ## 通行凭证规则（签发 / 查询 / 取消）
 
@@ -653,9 +769,10 @@ docker compose up --build
 首次启动时应用会自动建表（`regions`、`region_meta`、`passes`、
 `commitments`（含兑现标记列 `fulfilled_at`/`fulfilled_pass_id`）、
 `observations`、`observation_events`、
-`idempotency_keys`、`region_change_audit`）并初始化全局版本号，无需手工执行 SQL；
-既有库再次启动会自动补齐新增列（不改变任何现有行）。数据库未就绪时应用会
-自动重试连接（默认 30 次、间隔 1 秒）。
+`idempotency_keys`、`region_change_audit`、`scheduled_batches`）并初始化全局版本号，无需手工执行 SQL；
+既有库再次启动会自动补齐新增列与新增表（不改变任何现有行）。数据库未就绪时应用会
+自动重试连接（默认 30 次、间隔 1 秒）。启动时会先同步处理一轮重启期间到期的
+待执行预约，之后由内置后台执行器周期（0.2s）领取到期预约。
 
 停止并清理数据卷：
 
@@ -700,6 +817,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | DELETE | `/api/regions/{id}` | 删除区域；支持幂等键 |
 | POST | `/api/regions/batch` | 多处区域登记/修订/删除一次原子提交，并核验指定轨迹全部安全；支持幂等键 |
 | POST | `/api/regions/batch/preview` | 批量变更影响预演（只读）：报告轨迹结论与穿越明细、将冲突凭证、将被清空承诺、观察净翻转 |
+| POST | `/api/regions/batch/schedule` | 预约一次未来执行的批量变更（201 pending）：带时区未来执行时刻 + 同批量的 expected_revision/operations/trajectories |
+| GET | `/api/regions/batch/schedule/{id}` | 查询预约：状态、执行时间、成功提交结果（result）或失败原因（error） |
+| POST | `/api/regions/batch/schedule/{id}/cancel` | 取消待执行预约（幂等）；终态取消 409、未知编号 404 |
 | GET | `/api/regions/changes` | 区域集合变更只读审计历史：按全局 revision 游标升序分页 |
 | GET | `/api/revision` | 当前区域集合全局版本号（任意写操作后单调 +1） |
 | POST | `/api/verify` | 对一条绝对时刻轨迹做整段穿越核验 |
@@ -1242,6 +1362,15 @@ revision 冲突、区域变更与未取消凭证冲突、幂等键冲突）。�
 `duplicate_region`、`invalid_operation`、`unsafe_trajectory`（均 422）；
 `/api/regions/batch/preview` 沿用批量变更的同一组错误码（轨迹不安全与
 凭证/承诺冲突在预演中不作为错误，只写入报告）；
+预约未来批量变更（`/api/regions/batch/schedule`）受理另用
+`execution_time_not_in_future`（422，执行时刻不严格晚于受理时刻）与
+`scheduled_batch_terminal`（409，取消已成功/已失败的终态预约，details
+带 `status`）；执行时刻不带时区与其它结构问题返回 422
+`validation_error`；到期执行失败的原因沿用批量变更错误码
+（`revision_conflict`/`region_not_found`/`duplicate_region`/
+`invalid_operation`/`unsafe_trajectory`/`pass_conflict`/
+`commitment_conflict` 等）保存在预约行的 `error` 中可查询，不另发 HTTP
+响应（执行发生在后台）；
 凭证相关另用 `pass_conflict`（409，区域变更危及未取消凭证）与
 `not_found`（404，未知凭证 ID）；
 择时承诺另用 `commitment_conflict`（409，区域变更抹掉未结束承诺窗口内的
@@ -1311,6 +1440,12 @@ bash examples/curl_exemptions.sh
 # 凭证冲突/承诺清空/观察净翻转报告、错误契约、预演无副作用、与正式提交对照）
 bash examples/curl_batch_preview.sh
 
+# 预约未来批量变更（受理 201 pending、非未来/无时区/格式错误契约、
+# 到期成功一次性提交、到期失败原因可查且区域不变、观察翻转与审计同事务、
+# 按执行时刻+编号顺序、取消幂等与终态 409、取消/执行竞争唯一终态、
+# 并发至多一次提交、重启恢复）
+bash examples/curl_scheduled_batch.sh
+
 # 仅用 Python 标准库的调用示例（含调度两段安全区间与通行凭证演示）
 python3 examples/python_client.py
 ```
@@ -1376,18 +1511,27 @@ DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_
 # 标识不占用编号、凭证冲突/承诺清空/观察净翻转报告、与批量变更一致的错误
 # 契约、预演全程无副作用、预演结论与正式提交保护规则一致，会清空全部业务表）
 DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_batch_preview_api.py
+
+# 预约未来批量变更 API 集成测试（受理只校验格式且不预占 revision/编号、
+# 非未来/无时区/重复区域/非法操作等受理契约、到期成功一次性提交且 revision
+# 只推进一次、到期各类失败沿用批量错误码且区域集合不变、观察翻转与审计同
+# 事务、按执行时刻+编号顺序处理、取消幂等与终态 409/未知 404、取消/执行
+# 竞争唯一终态、并发执行至多提交一次、重启恢复、失败不阻塞后续，会清空
+# 全部业务表）
+DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_scheduled_batch_api.py
 ```
 
 ## 项目结构
 
 ```
 app/
-  main.py        # FastAPI 路由、事务边界、错误处理（verify、schedule、最小区域豁免预演、batch、批量变更影响预演、passes、commitments（含承诺兑现为固定时刻凭证）、observations、区域变更审计历史、幂等键）
-  schemas.py     # Pydantic 请求/响应模型与输入校验（含批量操作判别联合、批量变更影响预演报告模型、承诺兑现请求/响应模型、观察与事件分页模型、区域变更审计分页模型、豁免预演模型）
+  main.py        # FastAPI 路由、事务边界、错误处理（verify、schedule、最小区域豁免预演、batch、批量变更影响预演、预约未来批量变更、passes、commitments（含承诺兑现为固定时刻凭证）、observations、区域变更审计历史、幂等键）
+  scheduler.py   # 到期预约批量变更的后台执行器（守护线程按执行时刻+编号 SKIP LOCKED 领取，在共用 meta 事务锁内重验，成功同事务提交、失败保存点回滚并记录沿用批量错误码的原因）
+  schemas.py     # Pydantic 请求/响应模型与输入校验（含批量操作判别联合、批量变更影响预演报告模型、预约未来批量变更模型、承诺兑现请求/响应模型、观察与事件分页模型、区域变更审计分页模型、豁免预演模型）
   geometry.py    # 穿越核验、安全出发区间与最小区域豁免预演引擎（插值、裁剪、合并、区间差、等覆盖基本段枚举）
-  repository.py  # 区域 CRUD、一致性快照读取、批量原子变更事务、批量变更只读影响预演、通行凭证/择时承诺（含承诺兑现事务）/安全状态观察签发与取消、区域写入前的凭证与承诺保护、写入成功后的观察结论翻转事件与区域变更审计追加、幂等键占位/回放
-  db.py          # psycopg3 连接池、建表初始化（regions/region_meta/passes/commitments（含兑现标记列 fulfilled_at/fulfilled_pass_id）/observations/observation_events/idempotency_keys/region_change_audit；既有库自动补列）、启动重试
-examples/        # curl 与 Python 调用示例（含批量原子变更、批量变更影响预演、通行凭证、择时承诺及其兑现、安全状态观察、区域集合变更审计历史、最小区域豁免预演与幂等重试）
-tests/           # 几何离线测试与 API/批量变更/批量变更影响预演/通行凭证/择时承诺/承诺兑现/安全状态观察/区域变更审计历史/最小区域豁免预演/幂等键集成测试
+  repository.py  # 区域 CRUD、一致性快照读取、批量原子变更事务、批量变更只读影响预演、预约未来批量变更（受理/领取/取消/终态写回）、通行凭证/择时承诺（含承诺兑现事务）/安全状态观察签发与取消、区域写入前的凭证与承诺保护、写入成功后的观察结论翻转事件与区域变更审计追加、幂等键占位/回放
+  db.py          # psycopg3 连接池、建表初始化（regions/region_meta/passes/commitments（含兑现标记列 fulfilled_at/fulfilled_pass_id）/observations/observation_events/idempotency_keys/region_change_audit/scheduled_batches；既有库自动补列补表）、启动重试
+examples/        # curl 与 Python 调用示例（含批量原子变更、批量变更影响预演、预约未来批量变更、通行凭证、择时承诺及其兑现、安全状态观察、区域集合变更审计历史、最小区域豁免预演与幂等重试）
+tests/           # 几何离线测试与 API/批量变更/批量变更影响预演/预约未来批量变更/通行凭证/择时承诺/承诺兑现/安全状态观察/区域变更审计历史/最小区域豁免预演/幂等键集成测试
 Dockerfile, docker-compose.yml
 ```

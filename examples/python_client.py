@@ -136,6 +136,49 @@ def main() -> None:
             call("DELETE", f"/api/regions/{created['region_id']}")
     show("批量示例区域已清理", {"revision": call("GET", "/api/revision")["revision"]})
 
+    # ---- 预约未来批量变更：受理（只校验格式）/ 查询 / 取消 ----
+    revision = call("GET", "/api/revision")["revision"]
+    execute_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    scheduled = call("POST", "/api/regions/batch/schedule", {
+        "execute_at": execute_at,            # 带时区的未来执行时刻（可提交 +08:00）
+        "expected_revision": revision,       # 受理不预占、到期才重验
+        "operations": [
+            {"action": "create", "name": "预约-A区",
+             "polygon": [[0, 0], [100, 0], [100, 100], [0, 100]],
+             "valid_from": "2030-01-01T00:00:00Z",
+             "valid_to": "2031-01-01T00:00:00Z"},
+        ],
+        "trajectories": [
+            [{"x": -50, "y": 200, "t": "2030-06-01T00:00:00Z"},
+             {"x": 350, "y": 200, "t": "2030-06-01T00:02:00Z"}],
+        ],
+    })
+    show("预约未来批量变更（201 pending；不预占 revision/编号、不保证届时可提交）",
+         scheduled)
+    schedule_id = scheduled["id"]
+    show("查询预约（pending：result/error 均为空）",
+         call("GET", f"/api/regions/batch/schedule/{schedule_id}"))
+
+    # 执行时刻非未来 → 422 execution_time_not_in_future（受理失败不留预约）
+    try:
+        call("POST", "/api/regions/batch/schedule", {
+            "execute_at": "2020-01-01T00:00:00Z",
+            "expected_revision": revision,
+            "operations": [{"action": "delete", "id": 1}],
+            "trajectories": [
+                [{"x": -50, "y": 200, "t": "2030-06-01T00:00:00Z"},
+                 {"x": 350, "y": 200, "t": "2030-06-01T00:02:00Z"}]],
+        })
+    except urllib.error.HTTPError as exc:
+        err = json.loads(exc.read().decode())
+        show("非未来执行时刻被拒：422 execution_time_not_in_future", err)
+
+    # 取消（幂等；终态 succeeded/failed 再取消会得到 409 scheduled_batch_terminal）
+    cancel1 = call("POST", f"/api/regions/batch/schedule/{schedule_id}/cancel")
+    show("取消待执行预约（cancelled=true）", cancel1)
+    cancel2 = call("POST", f"/api/regions/batch/schedule/{schedule_id}/cancel")
+    show("重复取消（幂等，cancelled=false，状态不变）", cancel2)
+
     # ---- 通行凭证：签发 / 查询 / 取消，以及凭证对区域变更的约束 ----
     # 轨迹时刻必须在签发时刻之后，这里用当前时间 +5/+10 分钟
     t1 = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
