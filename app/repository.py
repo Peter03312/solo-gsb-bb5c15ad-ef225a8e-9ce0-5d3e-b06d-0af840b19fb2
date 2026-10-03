@@ -10,6 +10,7 @@ from shapely.wkt import dumps as wkt_dumps
 
 from . import geometry
 from .schemas import (
+    RegionBatchRequest,
     RegionCreateInBatch,
     RegionDeleteInBatch,
     RegionUpdateInBatch,
@@ -164,6 +165,21 @@ class ExemptionDuplicateRegions(Exception):
     def __init__(self, duplicates: list[int]):
         super().__init__("候选豁免编号存在重复")
         self.duplicates = duplicates
+
+
+# ---------------------------------------------------------------- 批量调整预约
+
+class ExecutionNotInFuture(Exception):
+    """预约执行时刻不晚于服务端受理时刻（当前服务时间）。"""
+
+
+class ReservationAlreadyTerminal(Exception):
+    """预约已处于终态（committed/failed/cancelled），不能取消。"""
+
+    def __init__(self, reservation_id: int, status: str):
+        super().__init__(f"预约 {reservation_id} 已处于终态（{status}），不能取消")
+        self.reservation_id = reservation_id
+        self.status = status
 
 
 def _row_to_region(row: dict) -> dict:
@@ -1615,3 +1631,293 @@ def list_observation_events(
     rows = cur.fetchall()
     has_more = len(rows) > limit
     return rows[:limit], has_more
+
+
+# ---------------------------------------------------------------- 批量调整预约
+
+_RESERVATION_COLUMNS = (
+    "id, execute_at, payload, status, result, failure,"
+    " created_at, executed_at, cancelled_at"
+)
+
+# 执行时重验失败可记录的全部批量变更业务异常（沿用批量变更错误码）
+_RESERVATION_FAILURE_ERRORS = (
+    BatchRevisionConflict,
+    BatchRegionsNotFound,
+    BatchDuplicateRegion,
+    BatchInvalidOperation,
+    BatchUnsafeTrajectories,
+    PassConflict,
+    CommitmentConflict,
+)
+
+
+def validate_batch_static(operations) -> None:
+    """受理预约时的静态校验：与数据库状态无关的批量输入格式检查。
+
+    同一现有区域在一批中只能出现一次（duplicate_region）；create 操作的
+    生效时段必须递增（invalid_operation）。revision 比对、区域存在性、
+    update 合并后的时段、轨迹安全与凭证/承诺保护均推迟到执行时刻重验。
+    """
+    _check_batch_operation_targets(operations)
+    for i, op in enumerate(operations):
+        if isinstance(op, RegionCreateInBatch):
+            try:
+                op.validate_time_order()
+            except ValueError as exc:
+                raise BatchInvalidOperation(i, str(exc), "valid_from") from exc
+
+
+def _iso_z(dt: datetime) -> str:
+    """UTC ISO8601 并带 Z 后缀（与 API 输出一致）。"""
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def verify_results_to_json(results: list[dict]) -> list[dict]:
+    """把几何层核验结果（穿越时刻为 epoch 秒）转成纯 JSON（UTC Z 时刻）。
+
+    输出形状与批量变更成功响应的逐区域明细一致，供预约提交结果与失败
+    原因落库（JSONB）后直接回读。
+    """
+    out_results = []
+    for r in results:
+        crossings = []
+        for c in r["crossings"]:
+            crossings.append({
+                "entry_time": _iso_z(datetime.fromtimestamp(c["entry_time"], tz=timezone.utc)),
+                "exit_time": _iso_z(datetime.fromtimestamp(c["exit_time"], tz=timezone.utc)),
+                "entry_inclusive": c["entry_inclusive"],
+                "exit_inclusive": c["exit_inclusive"],
+                "point_contact": c["point_contact"],
+            })
+        out_results.append({
+            "region_id": r["region_id"],
+            "region_name": r["region_name"],
+            "crossings": crossings,
+        })
+    return out_results
+
+
+def batch_error_payload(exc: Exception) -> dict:
+    """把批量变更业务异常映射为可查询的失败原因。
+
+    code/message/details 与对应 HTTP 错误响应同码同构（沿用现有批量变更
+    错误码），供预约执行失败时落库并在查询时原样返回。
+    """
+    if isinstance(exc, BatchRevisionConflict):
+        return {
+            "code": "revision_conflict",
+            "message": str(exc),
+            "details": [{
+                "loc": ["expected_revision"],
+                "message": f"预期 revision={exc.expected}，当前 revision={exc.current}",
+                "current_revision": exc.current,
+            }],
+        }
+    if isinstance(exc, BatchRegionsNotFound):
+        return {
+            "code": "region_not_found",
+            "message": str(exc),
+            "details": [{
+                "loc": ["operations", str(m["index"]), "id"],
+                "message": f"区域 {m['region_id']} 不存在",
+                "operation_index": m["index"],
+                "region_id": m["region_id"],
+            } for m in exc.missing],
+        }
+    if isinstance(exc, BatchDuplicateRegion):
+        return {
+            "code": "duplicate_region",
+            "message": str(exc),
+            "details": [{
+                "loc": ["operations"],
+                "message": f"区域 {exc.region_id} 在同一批中出现了多次",
+                "region_id": exc.region_id,
+                "operation_indices": exc.indices,
+            }],
+        }
+    if isinstance(exc, BatchInvalidOperation):
+        loc = ["operations", str(exc.index)] + ([exc.field] if exc.field else [])
+        return {
+            "code": "invalid_operation",
+            "message": exc.message,
+            "details": [{"loc": loc, "message": exc.message,
+                         "operation_index": exc.index}],
+        }
+    if isinstance(exc, BatchUnsafeTrajectories):
+        details = []
+        for t in exc.trajectory_results:
+            if t["safe"]:
+                continue
+            violated = [r for r in t["results"] if r["crossings"]]
+            details.append({
+                "trajectory_index": t["index"],
+                "results": verify_results_to_json(violated),
+            })
+        return {
+            "code": "unsafe_trajectory",
+            "message": "存在轨迹在变更后区域集合下发生穿越，整批变更已取消且不落库",
+            "details": details,
+        }
+    if isinstance(exc, PassConflict):
+        return {
+            "code": "pass_conflict",
+            "message": str(exc),
+            "details": [{
+                "pass_id": pid,
+                "message": f"凭证 {pid}（未取消且末点时刻未过）的轨迹在变更后区域集合下不再安全",
+            } for pid in exc.pass_ids],
+        }
+    if isinstance(exc, CommitmentConflict):
+        return {
+            "code": "commitment_conflict",
+            "message": str(exc),
+            "details": [{
+                "commitment_id": cid,
+                "message": f"承诺 {cid}（未取消且窗口未结束）在变更前仍有未来安全出发时刻，"
+                           f"变更后窗口结束前将不再有任何安全出发时刻",
+            } for cid in exc.commitment_ids],
+        }
+    raise TypeError(f"未支持的批量变更异常类型: {type(exc)!r}")
+
+
+def create_reservation(cur, execute_at: datetime, payload: dict) -> dict:
+    """受理一条批量调整预约：校验执行时刻在未来后持久化（不预占 revision）。
+
+    execute_at 必须晚于服务端受理时刻（当前服务时间），否则抛
+    ExecutionNotInFuture；payload 为规范化批量变更请求
+    （expected_revision/operations/trajectories），原样存入 JSONB。
+    """
+    now = utcnow()
+    if execute_at <= now:
+        raise ExecutionNotInFuture(
+            f"执行时刻必须晚于受理时刻（当前服务时间 {_iso_z(now)}）"
+        )
+    cur.execute(
+        """
+        INSERT INTO batch_reservations (execute_at, payload)
+        VALUES (%(execute_at)s, %(payload)s::jsonb)
+        RETURNING """ + _RESERVATION_COLUMNS,
+        {"execute_at": execute_at, "payload": json.dumps(payload)},
+    )
+    return cur.fetchone()
+
+
+def get_reservation(cur, reservation_id: int) -> dict | None:
+    cur.execute(
+        "SELECT " + _RESERVATION_COLUMNS
+        + " FROM batch_reservations WHERE id = %s",
+        (reservation_id,),
+    )
+    return cur.fetchone()
+
+
+def cancel_reservation(cur, reservation_id: int) -> dict | None:
+    """取消待执行预约；未找到返回 None，已处终态抛 ReservationAlreadyTerminal。
+
+    预约行 FOR UPDATE 锁定：取消与到期执行在同一行锁上竞争，谁先持锁
+    谁生效，同一预约只产生一个终态（已取消的预约执行器会直接跳过）。
+    """
+    cur.execute(
+        "SELECT " + _RESERVATION_COLUMNS
+        + " FROM batch_reservations WHERE id = %s FOR UPDATE",
+        (reservation_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    if row["status"] != "pending":
+        raise ReservationAlreadyTerminal(reservation_id, row["status"])
+    cur.execute(
+        """
+        UPDATE batch_reservations
+        SET status = 'cancelled', cancelled_at = now()
+        WHERE id = %s
+        RETURNING """ + _RESERVATION_COLUMNS,
+        (reservation_id,),
+    )
+    return cur.fetchone()
+
+
+def list_due_reservation_ids(cur, now: datetime) -> list[int]:
+    """到期待执行预约编号：按执行时刻升序、同刻按编号升序（处理顺序）。"""
+    cur.execute(
+        """
+        SELECT id FROM batch_reservations
+        WHERE status = 'pending' AND execute_at <= %s
+        ORDER BY execute_at ASC, id ASC
+        """,
+        (now,),
+    )
+    return [r["id"] for r in cur.fetchall()]
+
+
+def execute_reservation(cur, reservation_id: int) -> dict | None:
+    """在单个写事务内执行一条到期预约（重验 + 一次性提交 + 状态翻转）。
+
+    * 预约不存在：返回 None；
+    * 已非 pending（已取消/已提交/已失败）：直接返回当前行——同一预约
+      无论重启还是并发处理都至多提交一次（状态翻转与区域变更同事务，
+      预约行 FOR UPDATE 锁定使并发执行器串行，后到者读到终态即跳过）；
+    * pending：重建规范化批量请求，调用 apply_batch 在与现有区域写入
+      共用的 region_meta 行锁内重验 revision、操作、轨迹安全与凭证/
+      承诺保护。成功则区域、revision、观察翻转事件与审计一次性落库，
+      本行置 committed 并记录提交结果；重验失败（沿用批量变更错误码）
+      时 apply_batch 在任何区域写入之前抛出，本行置 failed 并记录可
+      查询原因，区域集合不变。
+    """
+    cur.execute(
+        "SELECT " + _RESERVATION_COLUMNS
+        + " FROM batch_reservations WHERE id = %s FOR UPDATE",
+        (reservation_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    if row["status"] != "pending":
+        return row
+
+    # 受理时已规范化落库的请求可无损重建；轨迹结构在受理时已校验，这里
+    # 按同一几何规则重新展开（数据不可变，不会新引入结构错误）
+    payload = RegionBatchRequest.model_validate(row["payload"])
+    trajectories = [
+        geometry.validate_trajectory(points, lambda p: p.t)
+        for points in payload.trajectories
+    ]
+    try:
+        result = apply_batch(cur, payload, trajectories)
+    except _RESERVATION_FAILURE_ERRORS as exc:
+        failure = batch_error_payload(exc)
+        cur.execute(
+            """
+            UPDATE batch_reservations
+            SET status = 'failed', failure = %(failure)s::jsonb,
+                executed_at = now()
+            WHERE id = %(id)s
+            RETURNING """ + _RESERVATION_COLUMNS,
+            {"failure": json.dumps(failure), "id": reservation_id},
+        )
+        return cur.fetchone()
+
+    committed = {
+        "revision": result["revision"],
+        "operations": result["operations"],
+        "trajectories": [
+            {
+                "index": check["index"],
+                "safe": check["safe"],
+                "results": verify_results_to_json(check["results"]),
+            }
+            for check in result["trajectory_results"]
+        ],
+    }
+    cur.execute(
+        """
+        UPDATE batch_reservations
+        SET status = 'committed', result = %(result)s::jsonb,
+            executed_at = now()
+        WHERE id = %(id)s
+        RETURNING """ + _RESERVATION_COLUMNS,
+        {"result": json.dumps(committed), "id": reservation_id},
+    )
+    return cur.fetchone()

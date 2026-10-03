@@ -26,6 +26,7 @@ services:
       DATABASE_URL: postgresql://restrict:restrict@db:5432/restrict
       DB_CONNECT_RETRIES: "30"
       DB_CONNECT_INTERVAL: "1"
+      RESERVATION_WORKER_INTERVAL: "0.5"
     ports:
       - "${API_PORT:-8000}:8000"
 

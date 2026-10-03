@@ -181,6 +181,40 @@ CREATE TABLE IF NOT EXISTS region_change_audit (
     CONSTRAINT region_change_audit_type_check
         CHECK (change_type IN ('create', 'update', 'delete', 'batch'))
 );
+
+-- 批量限行区域调整预约：安全员提交带时区执行时刻、预期 revision 与批量
+-- 变更请求（operations/trajectories），受理时只校验输入格式（不预占
+-- revision、不保证届时可提交）。到期由后台执行器按 (execute_at, id) 顺序
+-- 取出，在与区域写入共用的 region_meta 行锁写事务内重验 revision、操作、
+-- 轨迹安全与凭证/承诺保护：成功则一次性提交区域变更并把本行置为
+-- committed（提交结果入 result）；失败则区域集合不变，本行置为 failed
+-- 并记录沿用批量变更错误码的可查询原因（failure）。预约行在执行事务内
+-- FOR UPDATE 锁定，状态翻转与区域变更同一事务提交，因此无论重启还是
+-- 并发处理，同一预约至多提交一次；pending 预约可取消，取消与执行在同一
+-- 行锁上竞争，只产生一个终态。
+CREATE TABLE IF NOT EXISTS batch_reservations (
+    id              BIGSERIAL PRIMARY KEY,
+    -- 带时区的执行时刻（服务端归一化为 UTC 存储）
+    execute_at      TIMESTAMPTZ NOT NULL,
+    -- 规范化批量变更请求：
+    -- {"expected_revision": .., "operations": [...], "trajectories": [...]}
+    payload         JSONB NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    -- 提交结果（status='committed' 时写入，与批量变更成功响应同构）：
+    -- {"revision": .., "operations": [...], "trajectories": [...]}
+    result          JSONB,
+    -- 失败原因（status='failed' 时写入，沿用批量变更错误码）：
+    -- {"code": .., "message": .., "details": [...]}
+    failure         JSONB,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    executed_at     TIMESTAMPTZ,
+    cancelled_at    TIMESTAMPTZ,
+    CONSTRAINT batch_reservations_status_check
+        CHECK (status IN ('pending', 'committed', 'failed', 'cancelled'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_batch_reservations_due
+    ON batch_reservations (status, execute_at, id);
 """
 
 

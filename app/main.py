@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -32,9 +34,11 @@ from .repository import (
     ExemptionDuplicateRegions,
     ExemptionRegionsNotFound,
     ExemptionRevisionConflict,
+    ExecutionNotInFuture,
     IdempotencyKeyConflict,
     PassConflict,
     PassUnsafe,
+    ReservationAlreadyTerminal,
 )
 from .schemas import (
     CommitmentFulfillRequest,
@@ -58,6 +62,8 @@ from .schemas import (
     RegionOut,
     RegionResultOut,
     RegionUpdate,
+    ReservationCreateRequest,
+    ReservationOut,
     RevisionOut,
     ScheduleRequest,
     ScheduleResponse,
@@ -69,17 +75,104 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("restriction-service")
 
 
+# ---------------------------------------------------------------- 到期预约执行器
+
+# 后台线程轮询间隔（秒）：到期预约按 (execute_at, id) 顺序逐个执行
+RESERVATION_WORKER_INTERVAL = float(
+    os.environ.get("RESERVATION_WORKER_INTERVAL", "0.5")
+)
+_reservation_worker_stop = threading.Event()
+_reservation_worker_thread: threading.Thread | None = None
+
+
+def process_due_reservations() -> list[int]:
+    """处理全部到期待执行预约，返回本轮处理过的预约编号（按处理顺序）。
+
+    到期集合按 (execute_at, id) 升序取出后逐个在**独立写事务**内执行：
+    每条预约的重验、区域变更与状态翻转同一事务提交，单条失败（含未预期
+    错误回滚留待下轮重试）不影响后续预约。执行器与取消在同一预约行锁上
+    竞争，与所有区域写入在 region_meta 行锁上串行化。
+    """
+    processed: list[int] = []
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            due_ids = repository.list_due_reservation_ids(
+                cur, repository.utcnow()
+            )
+        conn.commit()  # 只读取出到期集合，释放快照
+        for reservation_id in due_ids:
+            conn.rollback()
+            with conn.cursor() as cur:
+                repository.configure_cursor(cur)
+                try:
+                    row = repository.execute_reservation(cur, reservation_id)
+                except Exception:
+                    # 未预期错误（如数据库故障）：整事务回滚，预约保持
+                    # pending，下一轮（或重启后）重试；业务重验失败已在
+                    # execute_reservation 内落为 failed，不会走到这里
+                    conn.rollback()
+                    logger.exception(
+                        "预约 %s 执行出现未预期错误，留待下一轮重试", reservation_id
+                    )
+                    continue
+                else:
+                    conn.commit()
+            # 仅统计本轮真正执行的预约（取出到加锁之间被并发取消/执行的除外）
+            if row is not None and row["status"] in ("committed", "failed"):
+                processed.append(reservation_id)
+    return processed
+
+
+def _reservation_worker_loop() -> None:
+    while not _reservation_worker_stop.is_set():
+        try:
+            process_due_reservations()
+        except Exception:  # 连接池暂不可用等：记录后下一周期重试
+            logger.exception("到期预约处理轮次失败，将在下一周期重试")
+        _reservation_worker_stop.wait(RESERVATION_WORKER_INTERVAL)
+
+
+def start_reservation_worker() -> None:
+    """启动到期预约后台执行线程（幂等：已运行时不重复启动）。"""
+    global _reservation_worker_thread
+    if _reservation_worker_thread is not None and _reservation_worker_thread.is_alive():
+        return
+    _reservation_worker_stop.clear()
+    _reservation_worker_thread = threading.Thread(
+        target=_reservation_worker_loop,
+        name="batch-reservation-worker",
+        daemon=True,
+    )
+    _reservation_worker_thread.start()
+
+
+def stop_reservation_worker() -> None:
+    """停止到期预约后台执行线程（等待当前轮次结束）。"""
+    global _reservation_worker_thread
+    _reservation_worker_stop.set()
+    if _reservation_worker_thread is not None:
+        _reservation_worker_thread.join(timeout=10)
+        _reservation_worker_thread = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_pool()
+    # 到期预约执行器：持久化在库中的 pending 预约在重启后仍会按
+    # (execute_at, id) 顺序被取出执行；状态翻转与区域变更同一事务提交，
+    # 因此崩溃恢复不会重复提交同一预约
+    start_reservation_worker()
     yield
+    stop_reservation_worker()
     db.close_pool()
 
 
 app = FastAPI(
     title="临时限行核验服务",
-    version="1.10.0",
-    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；安全员还可把尚未取消、窗口未结束的承诺兑现为一张固定时刻通行凭证（POST /api/commitments/{id}/fulfill）：在与区域变更、承诺取消及凭证签发共用的写事务内重验出发时刻晚于受理时刻、落在原候选窗口与按当前区域集合重算的安全出发区间内，成功后原承诺按既有取消语义失效、只生成一张凭证，区域 revision 不变，并发兑现至多一次成功且失败方可区分已兑现与普通取消；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）在同一事务追加只读可分页的区域集合变更审计历史，并支持 Idempotency-Key 幂等重试；安全员还可对固定行程做最小区域豁免预演（只读）：在可豁免候选区域的子集中找出使候选窗口内存在安全出发时刻的最优方案（豁免数最少、最早安全时刻、编号字典序），预演不改变任何数据；也可对多区调整做批量变更影响预演（只读）：基于同一已提交快照报告各轨迹安全结论与穿越明细、将冲突的通行凭证、将被清空的择时承诺与观察结论净翻转，预演不改变任何数据、不占用区域编号。",
+    version="1.11.0",
+    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；安全员还可把尚未取消、窗口未结束的承诺兑现为一张固定时刻通行凭证（POST /api/commitments/{id}/fulfill）：在与区域变更、承诺取消及凭证签发共用的写事务内重验出发时刻晚于受理时刻、落在原候选窗口与按当前区域集合重算的安全出发区间内，成功后原承诺按既有取消语义失效、只生成一张凭证，区域 revision 不变，并发兑现至多一次成功且失败方可区分已兑现与普通取消；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）在同一事务追加只读可分页的区域集合变更审计历史，并支持 Idempotency-Key 幂等重试；安全员还可对固定行程做最小区域豁免预演（只读）：在可豁免候选区域的子集中找出使候选窗口内存在安全出发时刻的最优方案（豁免数最少、最早安全时刻、编号字典序），预演不改变任何数据；也可对多区调整做批量变更影响预演（只读）：基于同一已提交快照报告各轨迹安全结论与穿越明细、将冲突的通行凭证、将被清空的择时承诺与观察结论净翻转，预演不改变任何数据、不占用区域编号。安全员还可预约一次未来的批量限行区域调整（POST /api/regions/batch/reservations）：提交带时区执行时刻、预期 revision 与批量变更一致的 operations/trajectories，受理时只校验输入格式（不预占 revision、不保证届时可提交）；预约持久保存，到期由后台执行器按 (execute_at, id) 顺序在与区域写入共用的 region_meta 行锁写事务内重验 revision、操作、轨迹安全与凭证/承诺保护，成功才一次性提交区域变更、revision、观察翻转事件与审计，失败记录沿用批量变更错误码的可查询原因且不改变区域集合；同一预约无论重启或并发处理都至多提交一次，待执行预约可取消（取消与执行竞争只产生一个终态）。",
     lifespan=lifespan,
 )
 
@@ -582,6 +675,29 @@ async def _on_exemption_duplicate_regions(_request: Request, exc: ExemptionDupli
     )
 
 
+@app.exception_handler(ExecutionNotInFuture)
+async def _on_execution_not_in_future(_request: Request, exc: ExecutionNotInFuture):
+    return _error_response(
+        422,
+        "execution_not_in_future",
+        str(exc),
+        [{"loc": ["body", "execute_at"],
+          "message": "执行时刻必须晚于服务端受理时刻（当前服务时间）"}],
+    )
+
+
+@app.exception_handler(ReservationAlreadyTerminal)
+async def _on_reservation_already_terminal(_request: Request, exc: ReservationAlreadyTerminal):
+    return _error_response(
+        409,
+        "reservation_already_terminal",
+        str(exc),
+        [{"loc": ["path", "reservation_id"],
+          "message": f"预约已处于终态（{exc.status}），只有待执行（pending）预约可以取消",
+          "status": exc.status}],
+    )
+
+
 # ---------------------------------------------------------------- 区域管理
 
 @app.post("/api/regions", response_model=RegionCreatedResponse, status_code=201,
@@ -1006,6 +1122,125 @@ def preview_batch_change(payload: RegionBatchRequest):
         ],
         observation_flips=report["observation_flips"],
     )
+
+
+# ---------------------------------------------------------------- 批量调整预约
+
+def _reservation_row_to_out(row: dict) -> dict:
+    """把 batch_reservations 表行转成 API 输出（payload 为规范化请求 JSONB）。"""
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "execute_at": row["execute_at"],
+        "expected_revision": row["payload"]["expected_revision"],
+        "operations": row["payload"]["operations"],
+        "trajectories": row["payload"]["trajectories"],
+        "result": row["result"],
+        "failure": row["failure"],
+        "created_at": row["created_at"],
+        "executed_at": row["executed_at"],
+        "cancelled_at": row["cancelled_at"],
+    }
+
+
+@app.post("/api/regions/batch/reservations", response_model=ReservationOut,
+          status_code=201,
+          responses={
+              422: {"description": "输入格式非法、执行时刻不带时区或不晚于受理时刻"},
+          },
+          tags=["reservations"])
+def create_batch_reservation(payload: ReservationCreateRequest):
+    """预约一次**未来的批量限行区域调整**。
+
+    请求体在 `POST /api/regions/batch` 的基础上增加带时区的执行时刻
+    `execute_at`（服务端归一化为 UTC，且必须**晚于受理时刻**）。
+    受理时只校验**输入格式**（结构、多边形、轨迹、与数据库状态无关的
+    操作格式），**不预占 revision、不保证届时可提交**：revision 比对、
+    引用区域存在性、轨迹安全与凭证/承诺保护全部推迟到执行时刻，在与
+    现有区域写入共用的 region_meta 行锁写事务内重验。
+
+    成功受理返回 **201** 与预约编号、待执行状态（`pending`）；预约持久
+    保存，到期由后台执行器按 `(execute_at, id)` 顺序处理（重启不丢）。
+    执行结果（提交结果或失败原因）通过
+    `GET /api/regions/batch/reservations/{id}` 查询。
+
+    * 执行时刻不带时区：422 `validation_error`；不晚于受理时刻：422
+      `execution_not_in_future`；
+    * 轨迹/多边形/操作格式非法：422 `invalid_trajectory` /
+      `invalid_polygon` / `invalid_operation` / `duplicate_region` /
+      `validation_error`（与批量变更受理口径一致）。
+    """
+    # 轨迹合法性（点数、有限坐标、时刻严格递增）在几何层统一报错
+    for points in payload.trajectories:
+        geometry.validate_trajectory(points, lambda p: p.t)
+    # 与数据库状态无关的批量输入格式：同一现有区域重复出现、create 操作时段
+    repository.validate_batch_static(payload.operations)
+
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            try:
+                row = repository.create_reservation(
+                    cur,
+                    payload.execute_at,
+                    payload.model_dump(
+                        mode="json", exclude={"execute_at"},
+                        by_alias=True, exclude_none=True,
+                    ),
+                )
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+    return _reservation_row_to_out(row)
+
+
+@app.get("/api/regions/batch/reservations/{reservation_id}",
+         response_model=ReservationOut, tags=["reservations"])
+def get_batch_reservation(reservation_id: int = Path(ge=1)):
+    """按编号查询预约：状态、执行时刻、提交结果（committed）或失败原因
+    （failed，沿用批量变更错误码）；未知编号返回 404 `not_found`。"""
+    with db.pool.connection() as conn:
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            row = repository.get_reservation(cur, reservation_id)
+    if row is None:
+        raise StarletteHTTPException(status_code=404, detail={"error": {"code": "not_found",
+                                                               "message": f"预约 {reservation_id} 不存在"}})
+    return _reservation_row_to_out(row)
+
+
+@app.post("/api/regions/batch/reservations/{reservation_id}/cancel",
+          response_model=ReservationOut, tags=["reservations"])
+def cancel_batch_reservation(reservation_id: int = Path(ge=1)):
+    """取消**待执行**（pending）预约并返回预约状态。
+
+    取消与到期执行在同一预约行锁上竞争，**只产生一个终态**：取消先成功
+    则预约不再执行；执行先完成则取消得到 **409**
+    `reservation_already_terminal`（details 带当前终态）。已处于终态
+    （committed/failed/cancelled）的预约取消同样返回 409（不幂等），
+    未知编号返回 **404** `not_found`。取消不推进区域 revision。
+    """
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            try:
+                row = repository.cancel_reservation(cur, reservation_id)
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                if row is None:
+                    conn.rollback()
+                else:
+                    conn.commit()
+    if row is None:
+        raise StarletteHTTPException(status_code=404, detail={"error": {"code": "not_found",
+                                                               "message": f"预约 {reservation_id} 不存在"}})
+    return _reservation_row_to_out(row)
 
 
 # ---------------------------------------------------------------- 通行凭证
@@ -1650,6 +1885,9 @@ def root():
             "PATCH /api/regions/{id}", "DELETE /api/regions/{id}",
             "POST /api/regions/batch",
             "POST /api/regions/batch/preview",
+            "POST /api/regions/batch/reservations",
+            "GET /api/regions/batch/reservations/{id}",
+            "POST /api/regions/batch/reservations/{id}/cancel",
             "GET /api/regions/changes",
             "GET /api/revision", "POST /api/verify", "POST /api/schedule",
             "POST /api/exemptions/preview",

@@ -213,6 +213,42 @@ class RegionBatchRequest(BaseModel):
         return v
 
 
+class ReservationCreateRequest(BaseModel):
+    """预约一次未来的批量限行区域调整。
+
+    execute_at 为带时区的执行时刻（服务端归一化为 UTC，且必须晚于受理
+    时刻）；expected_revision/operations/trajectories 与
+    `POST /api/regions/batch` 完全一致。受理时只校验输入格式，不预占
+    revision、不保证届时可提交；到期才在写事务内重验全部提交条件。
+    """
+
+    execute_at: datetime = Field(
+        description="带时区的执行时刻（须晚于服务端受理时刻）"
+    )
+    expected_revision: int = Field(ge=0, description="客户端预期的全局 revision")
+    operations: list[BatchOperation] = Field(
+        min_length=1, description="区域操作列表，元素为 create/update/delete 之一"
+    )
+    trajectories: list[list[PointIn]] = Field(
+        min_length=1, description="至少一条带时区绝对时刻轨迹；每条至少 2 个点"
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("execute_at")
+    @classmethod
+    def _check_execute_at(cls, v: datetime) -> datetime:
+        return _require_utc(v, "execute_at")
+
+    @field_validator("trajectories")
+    @classmethod
+    def _check_trajectories(cls, v):
+        for i, pts in enumerate(v):
+            if not isinstance(pts, list) or len(pts) < 2:
+                raise ValueError(f"第 {i} 条轨迹至少需要 2 个坐标点")
+        return v
+
+
 class VerifyRequest(BaseModel):
     points: list[PointIn] = Field(min_length=2)
 
@@ -483,6 +519,24 @@ class RegionBatchResponse(_UTCDatetimeModel):
     trajectories: list[TrajectoryCheckOut]
 
 
+# ---------------------------------------------------------------- 批量调整预约
+
+class ReservationResultOut(_UTCDatetimeModel):
+    """预约到期执行成功的提交结果（与批量变更成功响应同构）。"""
+
+    revision: int
+    operations: list[BatchOperationResultOut]
+    trajectories: list[TrajectoryCheckOut]
+
+
+class ReservationFailureOut(BaseModel):
+    """预约到期执行失败的可查询原因（沿用批量变更错误码与明细结构）。"""
+
+    code: str
+    message: str
+    details: list[dict]
+
+
 # ---------------------------------------------------------------- 批量变更影响预演
 
 class BatchPreviewRegionResultOut(_UTCDatetimeModel):
@@ -581,6 +635,29 @@ class CommitmentFulfillResponse(_UTCDatetimeModel):
     pass_: PassOut = Field(alias="pass")
 
     model_config = ConfigDict(populate_by_name=True)
+
+
+class ReservationOut(_UTCDatetimeModel):
+    """批量限行区域调整预约：受理/查询/取消的统一响应。
+
+    status: pending（待执行）/ committed（已提交）/ failed（执行失败）/
+    cancelled（已取消）；execute_at 为带时区执行时刻（UTC 归一化）；
+    expected_revision、operations、trajectories 回显受理时的规范化请求；
+    result 仅在 committed 时非空（提交结果），failure 仅在 failed 时非空
+    （沿用批量变更错误码的失败原因）。
+    """
+
+    id: int
+    status: str
+    execute_at: datetime
+    expected_revision: int
+    operations: list[dict]
+    trajectories: list[list[PassPointOut]]
+    result: ReservationResultOut | None
+    failure: ReservationFailureOut | None
+    created_at: datetime
+    executed_at: datetime | None
+    cancelled_at: datetime | None
 
 
 class ObservationOut(_UTCDatetimeModel):
